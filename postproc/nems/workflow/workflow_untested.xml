@@ -1,0 +1,91 @@
+<?xml version="1.0"?>
+<!DOCTYPE workflow
+[
+<!ENTITY TOP_DIR "/home/Javier.Delgado/scratch/nems/g5nr/data/gamma/2j_5500x4000/">
+<!ENTITY START_YEAR "2006">
+<!ENTITY START_MONTH "09">
+<!ENTITY START_DAY "04">
+<!ENTITY START_HOUR "00">
+<!ENTITY START_MINUTE "00">
+<!ENTITY END_DATE   "200610010000" >
+<!ENTITY HISTORY_INTERVAL_HOURS "0.5">
+<!ENTITY RESTART_INTERVAL "00:12:00:00" > <!-- DD:HH:MM:SS -->
+<!ENTITY START_YMDH "&START_YEAR;&START_MONTH;&START_DAY;&START_HOUR;">
+
+<!ENTITY ATMOS_DIR "&TOP_DIR;/&START_YMDH;/hwrf_physics/atmos">
+
+<!ENTITY ACCOUNT "aoml-osse" >
+<!ENTITY PARTITION "" >
+<!ENTITY ROCOTO_LOG_DIR "./rocoto_log" >
+<!ENTITY MAX_TRIES "3" >
+
+<!ENTITY NPS_NODES "6" >
+<!ENTITY NPS_PROCS_PER_NODE "2">
+
+<!--ENTITY RUN_UPP_DEFAULT_CONF "/home/Javier.Delgado/scripts/nr_workflow/params.conf"-->
+<!ENTITY RUN_UPP_DEFAULT_CONF "/home/Javier.Delgado/scripts/nr_workflow/params.conf">
+<!ENTITY UPP_CASE "/home/Javier.Delgado/scripts/run_upp/master/conf/cases/2j_5500x4000_hwrfPhysics.conf">
+<!ENTITY OMAPY_MAIN_CONF "/home/Javier.Delgado/apps/omapy/stable/main.conf">
+<!ENTITY OMAPY_CASE_CONF "/home/Javier.Delgado/apps/omapy/stable/conf/cases/bsnr/gamma/2km/upp/2j_5500x4000.conf">
+<!ENTITY ATMOS_DIR "&TOP_DIR;/&START_YEAR;&START_MONTH;&START_DAY;&START_HOUR;/atmos">
+<!ENTITY EXEC_DIR "/home/Javier.Delgado/scripts/nr_workflow">
+
+<!ENTITY PYTHON_EXE "python">
+<!ENTITY KSH "/bin/ksh">
+<!ENTITY ZSH "/bin/zsh">
+
+<!ENTITY OMAPY_QUEUE "service">
+<!ENTITY OMAPY_WALLTIME "06:00:00">
+]>
+<workflow cyclethrottle="4" realtime="F" scheduler="moabtorque">
+	<log>
+		<cyclestr>&ROCOTO_LOG_DIR;/workflow/workflow_@Y@m@d@H@M</cyclestr>
+	</log>
+
+    <cycledef group="restart" >&START_YEAR;&START_MONTH;&START_DAY;&START_HOUR;&START_MINUTE; &END_DATE; &RESTART_INTERVAL;</cycledef>
+    <!--cycledef group="restart" >200609040000 &END_DATE; &RESTART_INTERVAL;</cycledef-->
+    <!--cycledef group="restart" >200609040000 200609290000 &RESTART_INTERVAL;</cycledef-->
+    <task cycledefs="restart" maxtries="&MAX_TRIES;" name="upp">
+        <join>
+            <cyclestr>&ROCOTO_LOG_DIR;/upp@Y@m@d@H@M.log</cyclestr>
+        </join>
+        <command>
+            <cyclestr>&EXEC_DIR;/run_upp_wrapper.zsh &RUN_UPP_DEFAULT_CONF; &UPP_CASE; &START_YEAR; &START_MONTH; &START_DAY; &START_HOUR; &START_MINUTE; @Y @m @d @H @M &HISTORY_INTERVAL_HOURS; &RESTART_INTERVAL;  </cyclestr>
+        </command>
+        <queue>service</queue>
+        <cores>1</cores>
+        <memory>6G</memory>
+        <walltime>07:00:00</walltime>
+        <account>&ACCOUNT;</account>
+        <native>-d .</native>
+        <jobname><cyclestr>run_upp_@Y@m@d@H@M</cyclestr></jobname>
+        <!--Wait for restart file to be presnt - need fhr (TODO : Minutes)-->
+		<dependency>
+        <sh><cyclestr>
+            start=`date --date="&START_MONTH;/&START_DAY;/&START_YEAR; &START_HOUR;:&START_MINUTE;" +%s` 
+            end=@s
+            fhr=$(( ($end - $start) / 3600 ))
+            fhr=`printf %04d $fhr`
+            ls &ATMOS_DIR;/nmmb_rst_01_nio_${fhr}h_00m_00.00s
+        </cyclestr></sh>
+		</dependency>
+    </task>
+
+    <task cycledefs="restart" maxtries="&MAX_TRIES;" name="omapy">
+        <join>
+             <cyclestr>&ROCOTO_LOG_DIR;/omapy@Y@m@d@H@M.log</cyclestr>
+        </join>
+        <command>
+            <cyclestr>&EXEC_DIR;/omapy_wrapper.zsh &START_YEAR; &START_MONTH; &START_DAY; &START_HOUR; &START_MINUTE;  @Y @m @d @H @M &HISTORY_INTERVAL_HOURS; &RESTART_INTERVAL; &OMAPY_MAIN_CONF; &OMAPY_CASE_CONF; </cyclestr>
+        </command>
+        <queue>&OMAPY_QUEUE;</queue>
+        <walltime>&OMAPY_WALLTIME;</walltime>
+        <cores>1</cores>
+        <account>&ACCOUNT;</account>
+        <native>-d .</native>
+        <jobname><cyclestr>omapy_@Y@m@d@H@M</cyclestr></jobname>
+        <dependency>
+            <taskdep task="upp" />
+        </dependency>
+    </task>
+</workflow>

@@ -1,0 +1,734 @@
+#!/usr/bin/env python
+
+"""
+This script does all necessary preprocessing of G5NR- and LIS- generated data
+files for use by the NEMS Preprocessing System (NPS). 
+This includes:
+ - Combining netCDF variables from separate collections of G5NR data into a 
+   single file
+ - Interpolating 3-D variables to isobaric levels (if option is set)
+ - Generating the NPS intermediate format (nps_int) files from the combined 
+   files
+  -> For derived fields, it can call the appropriate geos2wps utility to
+     generate the field.
+
+ASSUMPTIONS
+ - Meterological fields come from G5NR
+ - Soil fields come from LIS
+
+NOTES:
+ - Since LIS netCDF files are available separately and have a different
+   structure for the lat and lon dimensions, they are not merged with the
+   rest of the fields. They are used directly when generating the nps_int files.
+ - Theia time for 3 files with old code (g5nr_input_xform.py):  4409.21s user 438.99s 
+                                                       system 98% cpu 1:22:01.94 total
+
+TODO:
+ - It is not necessary to first create the combined netCDF file (except for debugging
+   purposes), so make it possible to just go directly from creating the (possibly
+   interpolated) netCDF variable and passing it to the nc2nps (cum ncVar2nps) routine, 
+
+
+"""
+import sys
+import os
+import re
+import logging
+from datetime import datetime as dtime
+from datetime import timedelta as tdelta
+import copy
+from ConfigParser import ConfigParser
+from optparse import OptionParser
+
+import numpy as np
+import netCDF4 as nc4
+import matplotlib.pyplot as plt
+from mpl_toolkits.basemap import Basemap
+
+from interp_routines import linear_interp_to_z
+from params import G5NR_Params as g5nr
+from params import GFS_Params as gfs
+from params import LIS_Params as lis
+from params import NPS_Params as nps_params
+from nps import nps_utils
+from nps import nps_int_utils
+
+#
+# Globals
+#
+_logger=None
+
+#
+# Module functions
+#
+def _default_log(log2stdout=logging.INFO, log2file=None, name='el_default'):
+    global _logger
+    if _logger is None:
+        _logger = logging.getLogger(name)
+        _logger.setLevel(log2stdout)
+        msg_str = '%(asctime)s::%(name)s::%(lineno)s::%(levelname)s - %(message)s'
+        msg_str = '%(asctime)s::%(funcName)s::%(filename)s:%(lineno)s::%(levelname)s - %(message)s'
+        date_format = "%H:%M:%S"
+        formatter = logging.Formatter(msg_str, datefmt=date_format)
+        if log2file is not None:
+            fh = logging.FileHandler('log.txt')
+            fh.setLevel(log2file)
+            fh.setFormatter(formatter)
+            _logger.addHandler(fh)
+        if log2stdout is not None:
+            ch = logging.StreamHandler()
+            ch.setLevel(log2stdout)
+            ch.setFormatter(formatter)
+            _logger.addHandler(ch)
+    return _logger
+
+
+
+def _parse_args():
+    parser = OptionParser()
+    parser.add_option("-c", "--config", dest="config_file")
+    parser.add_option("-l", "--log-level", dest="log_level", default=logging.INFO,
+                      help="(0-100 or constant defined in the logging module")
+    (options, args) = parser.parse_args()
+    try:
+        log_level = int(options.log_level)
+    except ValueError:
+        try:
+            log_level = getattr(logging, options.log_level)
+        except:
+            print 'Unrecognized log level:', options.log_level, '. Not setting.'
+    return (options.config_file, log_level)
+
+def _create_dim_vars(dest_dataset, src_dataset, in_levs=None, log=None):
+    """
+    Copy the 4 dimension variables (lat,lon,levs,time) from Dataset src_dataset
+    to Dataset dest_dataset. If in_levs is passed in, use it instead of the 
+    src_dataset's lev values. Since NPS just uses indices for the level
+    dimension, you'll want to pass this in (I think)
+    @param dest_dataset netCDF4.Dataset that will get the dimension variables
+    @param src_dataset netCDF4.Dataset that will provide the dimension variables.
+    @param in_levs List of levels to override src_dataset values with
+    """
+    log.debug("Copying attributes")
+    for var in ['lat', 'lon', 'lev', 'time']:
+        srcVariable = src_dataset.variables[var]
+        _copy_variable_attr(dest_dataset, srcVariable, log=log)
+        if var == 'lev' and in_levs is not None:
+            log.debug("Overriding input levels with passed in values")
+            dest_dataset.variables[var][:] = in_levs
+        else:
+            dest_dataset.variables[var][:] = srcVariable[:]
+
+
+def _copy_variable_attr(destDataset, srcVariable, outVarName=None, 
+                        dims=None, useZlib=True, log=None):
+    '''
+    Create a variable in Dataset `dest_dataset' using the attributes
+    of src_variable. The name of the variable will be obtained 
+    `outVarName'. 
+    NOTE : Only attributes are copied, not the data
+    @param destDataset nc4.Dataset where the variable will be created
+    @param srcVariable nc4.Variable containing the attributes to be copied
+    @param outVarName Name of the variable in dest_dataset. If not passed in,
+           use the same name as src_varable
+    @param dims The dimensions to use in the copied variable. By default, 
+           use the same ones as src_varable
+    @param useZlib True if zlib compression should be used
+    '''
+    if outVarName is None:
+        outVarName = srcVariable.name
+    if dims is None:
+        dims = srcVariable.dimensions
+    log.debug("Adding variable '{}' to `destDataset'...must be unique. Dims={}"
+              .format(outVarName, dims))
+    outVar = destDataset.createVariable(
+        outVarName, srcVariable.datatype, dims, 
+        zlib=useZlib
+        #zlib=v.zlib, 
+        #complevel=v.complevel, shuffle=v.shuffle,
+        #fletcher32=v.fletcher32
+                                   )
+    inAttrKeys = srcVariable.ncattrs()
+    inAttrValues = [ srcVariable.getncattr(k) for k in inAttrKeys]
+    #d = {}
+    for k in inAttrKeys: 
+        #d[k] = v.getncattr(k)
+        outVar.setncattr(k, srcVariable.getncattr(k))
+
+def get_g5nr_pressure_array(date, rootgrp, topdir, log=None):
+    """
+    Get the pressure array at the given time from the given dataset.
+    The dataset should have a field named 'DELP' that contains the
+    pressure thickness (i.e. delta), with the highest level being
+    at index 0 and the lowest level at the final index. 
+    This method just sums the DELP from the top, since that is what
+    the documentation says to do.
+    @param rootgrp NC4 Dataset object containing th needed fields
+    @param date datetime object representing the date of interest
+    @return the 3-d pressure array containing values at model levels,
+            in Pascals since that is what NPS uses.
+    @param topdir Directory where file containing DELP data can be
+           found
+    """
+    
+    '''
+    Previous version: I thought we had to add surface pressure (PS):
+    m = rootgrp.variables['DELP']
+    assert m.getncattr('units') == 'Pa' # this is what NPS uses
+    # delp is a 4-d array. We want to cummulatively sum along the
+    # level (i.e. second) dimension, starting from the bottom.
+    sfc_pres = rootgrp.variables['PS'][0,:,:]
+    m = m[0, ::-1, :, :] # note now it's 3d and in descending altitude
+    # we need to do a cummulative difference to the top of the atmosphere, 
+    # which is the bottom of the array
+    m = np.negative(m) 
+    m = np.insert(m, 0, sfc_pres, axis=0) # now has sfc pres. at (array) top
+    cumm_pres = np.cumsum(m, axis=0) # since m is now 3-d, lev axis=0
+    #import pdb ; pdb.set_trace()
+    return cumm_pres # i think
+    '''
+
+    '''
+    #
+    # This is to use pressure at the edges
+    #
+    fld =  MetField(g5nrName='DELP', srcDataset='inst30mn_3d_DELP_Nv', 
+                    topdir=topdir)
+    fileName = fld.get_input_file_path(date)
+    log.debug("Reading DELP from input file {}".format(fileName))
+    inDataset = nc4.Dataset(fileName)
+    # round off differences that can affect the interpolation, so round values 
+    assert inDataset.variables['DELP'].getncattr('units') == 'Pa' 
+    hyb_pres_array = np.cumsum(inDataset.variables['DELP'],axis=1)[0]
+    hyb_pres_array = np.round(hyb_pres_array, decimals=5)
+    # TODO ? : add units and any other metadata
+    # TODO (maybe) : ensure the missingValue here corresponds to that used in NPS
+    # TODO ? : DOES NPS need the pressure descending?
+    '''
+    #
+    # This is to use pressure at the interface
+    #
+    fld = MetField(g5nrName="PL", srcDataset="inst30mn_3d_PL_Nv", 
+                   topdir=topdir)
+    log.debug("Reading PL (mid-layer Pres) from input file {0}".format(fileName))
+    inDataset = nc4.Dataset(fileName)
+    assert inDataset.variables["PL"].getncattr('units') == 'Pa'
+    hyb_pres_array = inDataset.variables["PL"][:]
+
+    return hyb_pres_array
+
+def populate_pressure_var(destDataset, hybPresArray=None, interpolate=False,
+                        targetLevels=None, datatype=np.dtype('float32')):
+        """
+        Populate the 'PRESSURE' variable with either the hybrid
+        levels specified by input variable `hyb_pres_array' or the target 
+        levels specified by input argument `targetLevels' (if `interpolate' 
+        is True). Currently, only 1-d arrays are supported for `targetLevels' 
+        (i.e. isobaric conversion). Although it will still create a 3-D field
+        since that is what NPS expects.
+        PRECONDITION: The 'PRESSURE' variable must have already been created
+        @param destDataset netCDF4.Dataset containing the unpopulated
+                'PRESSURE' variable
+        @param hybPresArray 3-D array containing the hybrid pressure levels to
+               populate with if `interpolate' is False. Ignored otherwise
+        @param interpolate Do we want to interpolate to a different set of 
+                levels. Note that there is no interpolation done in this
+                function, we simply need to know whether to use the hybPresArray 
+                or the targetLevels.
+        @param targetLevels The target pressure levels to use, if interpolating
+        @param datatype NO LONGER USED ## The datatype to use when filling the Variable
+        """
+        #print dest_dataset.dimensions
+        #print inDataset.variables['DELP'].dimensions
+        # TODO : Get levels dynamically instead of hardcoding 
+        #         (hint: inDataset.variables['DELP'].dimensions)
+        if interpolate:
+            for idx,gfsLev in enumerate(targetLevels):
+                destDataset.variables['PRESSURE'][0,idx] = gfsLev
+        else:
+            #print hyb_pres_array[:,1000,1000]
+            destDataset.variables['PRESSURE'][0] = hybPresArray
+    
+def interp_modelLev_to_isobaric(input_array, in_levs, out_levs=None, fill_value=None, 
+                        increases_up=True):
+    '''
+    Interpolate an input array from model to isobaric pressure levels
+    @param arr array to interpolate
+    @param in_levs the levels that the data is available at
+    @param out_levs the levels to interpolate to
+    @param fill_value The value to give missing values
+    @param increases_up True if the variable increases with height (e.g. temp).
+                        False otherwise (e.g. Pressure)
+    @return the interpolated array
+    '''
+    print 'interpolating'
+    if out_levs is None:
+        out_levs = GFS_LEVELS
+    if fill_value is None:
+        fill_value = 1.e15
+    # ensure variables are of the type expected in interp_to_z
+    # TODO ? ensure integer types are same length?
+    assert input_array.dtype == np.dtype('float32')
+    assert in_levs.dtype == np.dtype('float32')
+    assert out_levs.dtype == np.dtype('float32')
+    #assert fill_value == np.dtype('float32')
+    #inArr = input_array[0]
+    ret = linear_interp_to_z(
+                        data_in=input_array, #inArr,
+                        z_in=in_levs, 
+                        z_out=out_levs, 
+                        undef=fill_value, 
+                        increases_up=increases_up)
+                        #input_array.shape(1),
+                        #input_array.shape(2), input_array.shape(0), 
+                        #len(out_levs), 
+    #import pdb ; pdb.set_trace()
+    return ret
+
+
+def datestr_to_datetime(startDate):
+    """
+    Convert a string in `MM-DD-YYYY hh:mm' format to a datetime
+    @param startDate The String
+    @return the datetime object
+    """
+    try:
+        mdy = startDate.split(" ")[0]
+        hm = startDate.split(" ")[1]
+        (month, day, year) = [int(x) for x in mdy.split("-")]
+        (hour, minute) = [int(x) for x in hm.split(":")]
+        #startDate = startDate.replace("'", "").replace('"', '')
+        #os.environ['TZ'] = 'UTC'
+        #tzset()
+        #return time.mktime(time.strptime(startDate, '%m-%d-%Y %H:%M'))
+        return dtime(year=year, month=month, day=day, 
+                                 hour=hour, minute=minute)
+    except ValueError:
+        print 'Given start date', startDate, 'does not match expected format MM-DD-YYYY hh:mm'
+        sys.exit(1)
+
+def merge_met_field(outVarName, g5nrField, dest_dataset, currDate,
+                    interpolate=False, inLevs=None, outLevs=None, log=None):
+    """
+    Merge an NPS field onto a target dataset, interpolating 3-D variables
+    to a different set of levels if necessary
+    @param outVarName The name to give the variable in the netCDF file. 
+                      Typically this is either the name expected by NPS
+                      or the same as 'g5nrField'
+    @param g5nrField  A MetField object representing field to be merged.
+                      It's important that mappings exist for this field
+                      in the G5NR_Params class to know where to retrieve
+                      the corresponding netCDF file and what variable name.
+    @param dest_dataset netCDF4.Dataset onto which the variable will be merged
+    @param currDate datetime.datetime object encapsulating the date of interest
+    @param interpolate True if we are interpolating to a different set of
+           levels.
+    @param inLevs 3-D array containing hybrid pressure levels of source 
+                  variable
+    @param outLevs    Array specifying the levels to interpolate to. Currently
+                      only isobaric levels are tested (so use a 1-d array)
+    """
+    if interpolate and (outLevs is None or inLevs is None):
+        raise Exception("If interpolate=True, specify outLevs and inLevs")
+    log.debug("Processing NPS field: {}".format(outVarName))
+    inPath = g5nrField.get_input_file_path(currDate)
+    #outVarName = g5nrField.get_nps_name()
+    log.debug("Will retrieve meterological field {} from file {}"
+              .format(g5nrField.g5nr_name, inPath))
+    inDataset = nc4.Dataset(inPath, 'r')
+    srcVar = inDataset.variables[g5nrField.g5nr_name]
+    log.debug("Copying attributes for NPS variable {}".format(outVarName))
+    _copy_variable_attr(dest_dataset, srcVar, outVarName, log=log) #, dims=dest_dimensions)
+    # TODO : Ensure all levels are being copied
+    if 'lev' in srcVar.dimensions:
+        log.debug("Copying 3-d variable {} to output dataset"
+                 .format(g5nrField.nps_name))
+        if interpolate:
+            log.debug("Interpolating variable {} to isobaric levs"
+                     .format(g5nrField.nps_name))
+            targetLevs = (1, len(outLevs), srcVar.shape[2],  
+                          srcVar.shape[3])
+            v_isobaric = np.empty(targetLevs,
+                                  order='F', # fortran
+                                  dtype=np.dtype('float32'))
+            v_isobaric[0] = \
+                interp_modelLev_to_isobaric(srcVar[0], in_levs=inLevs,
+                                            out_levs=outLevs)
+            dest_dataset.variables[outVarName][:] = v_isobaric
+        else:
+            log.debug("Merging 3-d variable '{}' to output dataset"
+                     .format(g5nrField.nps_name))
+            dest_dataset.variables[outVarName][:] = srcVar[:]
+        # test
+        print 'verification'
+        print 'non_interpolated values: ', srcVar[0,1:6,100,100]
+        if interpolate:
+            print 'after: ', v_isobaric[0,1:6,100,100]
+    
+    else: # 2-d var
+        if len(dest_dataset.variables[outVarName].dimensions) > 3:
+            log.warn("Variable {} has more than 3 dimensions, but "
+                     "processing as 2-D".format(outVarName))
+        dest_dataset.variables[outVarName][:] = srcVar[:]
+    
+    inDataset.close()
+
+def create_dims(destDataset, srcDatasetMet, srcDatasetSoil, log, numLevs=None):
+    '''
+    Create the netCDF dimension variables for destDataset, which
+    will have the same levels as the `srcDatasetSoil' and `srcDatasetMet`.
+    Only the 'num_soil_layers' will be obtained from the former, unless
+    there is not `srcDatasetMet'
+    '''
+    assert srcDatasetMet is not None or srcDatasetSoil is not None
+    log.debug("Creating dimensions for `destDataset'")
+    if srcDatasetMet is not None:
+        num_lats_src = len(srcDatasetMet.dimensions['lat'])
+        num_lons_src = len(srcDatasetMet.dimensions['lon'])
+        num_levs_src = len(srcDatasetMet.dimensions['lev'])
+   
+    if srcDatasetSoil is not None:
+        if srcDatasetMet is None:
+            log.debug("Since no met fields, getting lat and lon dimensions "
+                      "from soil fields".format())
+            num_lats_src = len(srcDatasetSoil.dimensions['lat'])
+            num_lons_src = len(srcDatasetSoil.dimensions['lon'])
+        # TODO : Generalize this for different soil layer names
+        #        Also, I'm working on the assumption that the ST and SM 
+        #        layer depths are the same
+        num_soil_levs_src = len(srcDatasetSoil.dimensions['SoilMoist_profiles'])
+            
+    # Create dimensions - hmmm levs are different for different vars
+    if numLevs is None:
+        numLevs = num_levs_src
+
+    log.debug("Will create the dimensions time, lev, lat, lon, num_soil_layers")
+    time = destDataset.createDimension('time', 1)
+    lev = destDataset.createDimension('lev', numLevs)
+    lat = destDataset.createDimension('lat', num_lats_src)
+    lon = destDataset.createDimension('lon', num_lons_src)
+    soil_levs = destDataset.createDimension('num_soil_layers', num_soil_levs_src)
+    
+    return (lat, lon, lev, soil_levs)
+
+def _get_nc2nps_fields_tupple(fieldList, date, metDataTopdir):
+    """
+    @param fieldList List of Field objects
+    @param metDataTopdir Path to find meterological data for the MetFields
+    @return A list of 4-tupples, as expected by the nps_utils.nc2nps routine.
+            The 4-tupple consists of (inName, outName, units, description)
+            e.g. ('TT','TT','K','air temperature')
+            The returned list have one entry for each element of `met_fields'
+    """
+    ret_list = []
+    for fld in fieldList:
+        #mf = get_met_field(fieldName, metDataTopdir)
+        # TODO : units and description are not in the metfield, they are in the nc file
+        # TODO : See hack in SoilField.nps_name definition
+        # TODO : If going direct from g5nr collection to nps_int, need to use the
+        #        mf.g5nr_name/lis_name. Since we're merging first, use nps_name
+        #ret_list.append( (mf.g5nr_name, mf.nps_name, mf.units(date), 
+        ret_list.append( (fld.nps_name, fld.nps_name, fld.units(date), 
+                          fld.description(date)) )
+    return ret_list
+
+def generate_input(startDate, duration, frequency, outFilePattern, npsIntOutDir,
+                   makeIsobaric=True, createNpsInt=True, pLevs=None, 
+                   metInputDir=None, lsmInputDir=None,
+                   metVars=[], lsmVars=[], log=None, extraNpsInt=False):
+    """
+    This is the main method for generating input for a s series of meteorological
+    and surface variables, for a given period of time.
+    @param startDate DateTime object representing first date to process
+    @param duration TimeDelta object representing duration to prrocess
+    @param frequency TimeDelta object representing how frequently to process
+    @param outFilePattern String representing the output file path. It will
+                          be interpolated with strftime
+    @param npsIntOutDir Path to put the intermediate format ("nps_int") files
+    @param makeIsobaric True if 3D fields should be interpolated
+                        to isobaric pressure levels
+    @param createNpsInt True if we should create the NPS intermediate format
+                        files
+    @param pLevs Pressure levels to interpolate to. Ignored if makeIsobaric is 
+                 False
+    @param metInputDir Top-level directory in which model data to be used as
+                       input resides
+    @param lsmInputDir Top-level directory in which land surface  data to be 
+                        used as input resides
+    @param metVars (NPS names of) meterological fields to process 
+    @param lsmVars (NPS names of) soil fields to process 
+    @param extraNpsInt If True, ask the nc_to_nps_int routine to create extra, 
+           separate nps_int files for each field/level (e.g. for debugging)
+    """
+    currDate = copy.copy(startDate)
+    while currDate <= startDate + duration:
+
+        # create list of MetField and SoilFields that need to be processed
+        met_fields = []
+        lsm_fields = []
+        for npsFieldName in metVars:
+            fld = get_met_field(npsFieldName, topdir=metInputDir, log=log)
+            met_fields.append(fld)
+        for npsFieldName in lsmVars:
+            lisField = get_soil_field(npsFieldName, topdir=lsmInputDir, log=log)
+            lsm_fields.append(lisField)
+
+
+        # create output file
+        outfile = currDate.strftime(outFilePattern)
+        tmp_outfile = outfile + '.tmp'
+        if os.path.exists(outfile):
+            # TODO : Also make sure all variables are present, since config may have
+            # changed
+            log.info("Skipping existing output file '{}'".format(outfile))
+        else:
+            # read first MET field to get dimensions
+            src_dataset_met = None
+            if len(metVars) > 0:
+                src_dataset_metfield = get_met_field(metVars[0], 
+                                                     topdir=metInputDir, log=log)
+                inMetPath = src_dataset_metfield.get_input_file_path(currDate)
+                log.debug("Reading met data input file {}".format(inMetPath))
+                src_dataset_met = nc4.Dataset(inMetPath, 'r')
+
+            # read first soil field to get num_soil_layers
+            src_dataset_soil = None
+            if len(lsmVars) > 0:
+                src_dataset_soilfield = get_soil_field(lsmVars[0], 
+                                                       topdir=lsmInputDir, log=log)
+                inSoilPath = src_dataset_soilfield.get_input_file_path(currDate)
+                log.debug("Reading soil data input file {}".format(inSoilPath))
+                src_dataset_soil = nc4.Dataset(inSoilPath)
+            log.debug('Creating output file {}'.format(tmp_outfile))
+            dest_dataset = nc4.Dataset(tmp_outfile, 'w', format="NETCDF4")
+            # TODO : The folllowing 4 lines only work if metInputDir passed in
+            # -> it's probably not necessary if only processing soil fields
+            #    since there is no interpolation
+            delp_metfield = MetField(g5nrName='DELP', 
+                                     srcDataset=g5nr.VAR_2_COLLECTION['DELP'], 
+                                     topdir=metInputDir, log=log)
+            delp_dataset = nc4.Dataset(delp_metfield.get_input_file_path(currDate), 'r')
+
+            numOutLevs = delp_dataset.variables['lev'].shape[0]
+            out_lev_idc = delp_dataset.variables['lev'][:]
+
+            if makeIsobaric:
+                numOutLevs = len(gfs.GFS_LEVELS)
+                out_lev_idc = range(1,len(gfs.GFS_LEVELS)+1)
+
+            (lat,lon,lev,soilLevs) = create_dims(dest_dataset, delp_dataset, 
+                                                 src_dataset_soil, log=log,
+                                                 numLevs=numOutLevs)
+            
+            _create_dim_vars(dest_dataset, delp_dataset, 
+                             in_levs=out_lev_idc, log=log)
+
+            # Create PRESSURE variable ; use DELP attributes 
+            hyb_pres_array = get_g5nr_pressure_array(currDate, delp_dataset, 
+                                                     topdir=metInputDir, log=log)
+            _copy_variable_attr(dest_dataset, delp_dataset.variables['DELP'], 
+                                'PRESSURE', log=log)
+            #dest_dataset.variables['PRESSURE'].setncattr("long_name", "pressure")
+            #dest_dataset.variables['PRESSURE'].setncattr("short_name", "pressure")
+            print dest_dataset.variables['PRESSURE'].ncattrs()
+            #dest_dataset.variables['PRESSURE'].setncatts({'long_name':'pressure', 
+            #                                              "standard_name":"pressure"})
+            # note : targetLevels ignored if interpolate is false
+            populate_pressure_var(dest_dataset, hybPresArray=hyb_pres_array, 
+                                interpolate=makeIsobaric, targetLevels=gfs.GFS_LEVELS,
+                                datatype=delp_dataset.variables['DELP'].datatype)
+
+            # Loop through meterological fields, merging each one's values into 
+            # dest_dataset
+            for metField in met_fields:
+                # TODO : if it is a derived field, there will be multiple g5nr fields to process
+                    g5nrField = metField
+                    # TODO ? It seems that the memory used to add each variable is not 
+                    # being freed. Maybe we should close and reopen the dataset 
+                    # on each iteration.
+                    dest_dataset.close()
+                    dest_dataset = nc4.Dataset(tmp_outfile, 'a', format="NETCDF4")
+                    # note : outLevs ignored if `interpolate' is False
+                    merge_met_field(g5nrField.nps_name, g5nrField, 
+                                    dest_dataset, currDate,
+                                    interpolate=makeIsobaric, 
+                                    inLevs=hyb_pres_array,
+                                    outLevs=gfs.GFS_LEVELS, 
+                                    log=log)
+            # LSM fields will be kept separate
+            #for npsFieldName in lsmVars:
+            #    log.debug("Processing LSM field w/ NPS name={}".format(npsFieldName))
+
+            #print 'before closing', dest_dataset.variables['TT'][0,:,100,100]
+            dest_dataset.close()
+            log.info("Finished creating merged netCDF4 file.")
+            log.debug("Renaming '{}' => '{}'".format(tmp_outfile, outfile))
+            os.rename(tmp_outfile, outfile)
+        
+        # Add pressure field to met_fields; cannot do this earlier since 
+        # it we don't want to merge it (it was already copied earlier). 
+        presField = MetField('PRESSURE', "None I am derived", wpsName='PRESSURE')
+        # Hack: put values for units and descripion; otherwise it will try to 
+        # get them from the srcDataset, but there is no srcDataset
+        presField._description = "pressure"
+        presField._units = "Pa"
+        met_fields.append(presField)
+        
+        # Now convert merged nc4 data to nps_int format for Met fields and soil fields
+        derived = [ f for f in met_fields if f.derived ]
+        non_derived = [ f for f in met_fields if not f.derived ]
+        lsm_outfile = lsm_fields[0].get_input_file_path(currDate) # TODO : may  not have any lsm_fields
+        # TODO : Have hardcoded source names here
+        sources = [ ('G5NR',non_derived,outfile), ('G5NR',derived,outfile), ('LIS',lsm_fields,lsm_outfile) ]
+        #import pdb ; pdb.set_trace()
+        for srcName,fieldList,filename in sources:
+            # PROBLEMS: (1) passing in derived and non_derived, which are lists of MetField
+            #               and lsmVars, whicih is a list of string (e.g. ['SM']
+            #                 -> i think i just need to make sure _get_nc2nps_fields_tupple works with MetField and SoilField types
+            # TODO move this entire block to a separate function
+            if len(fieldList) == 0: 
+                continue
+            log.info("Preparing to convert fields from {}".format(srcName))
+            int_file_name = nps_int_utils.get_int_file_name(srcName, currDate)
+            int_path = os.path.join(npsIntOutDir, int_file_name)
+            # TODO ? Can't remove here because there may be multiple sources with the same
+            # target (e.g. non_derived and derived both output to 'G5NR'
+            if os.path.exists(int_path):
+                log.warn("Appending to existing nps_int file {}".format(int_path))
+                #log.info("Removing existing nps_int file {}".format(int_path))
+                #os.unlink(int_path)
+            #tField = ('TT','TT','K','air temperature')
+            fields = _get_nc2nps_fields_tupple(fieldList, currDate, metInputDir)
+            xfcst = 0.0 # TODO - figure out if this needs to be actual forecast hour or what
+            if 'derived' in fieldList[0].__dict__ and fieldList[0].derived:
+                geos2wrf = True
+            else:
+                geos2wrf = False
+            nps_int_utils.nc_to_nps_int(filename, int_path, currDate, xfcst, 
+                                        fields, source=srcName.lower(), 
+                                        geos2wrf=geos2wrf, 
+                                        createIndividualFiles=extraNpsInt)
+        
+        # Now convert derived fields
+        for npsFieldName in derived:
+            log.debug("Creating derived fields")
+            # get callback corresponding to the NPS field and call it
+            g5nrFields = get_met_field(npsFieldName, topdir=metInputDir, log=log)
+            func = g5nr.NC_TO_INT(npsFieldName) 
+            int_file_name = nps_int_utils.get_int_file_name(npsFieldName, currDate)
+            int_path = os.path.join(npsIntOutDir, int_file_name)
+            log.info("Calling function {} to process derived variable {}. "
+                     "Output will be written to {}"
+                    .format(func.func_name, npsFieldName, int_path))
+            func(int_path)
+
+        currDate += frequency
+        #dest_dataset = nc4.Dataset(outFileName, 'r')
+        #print 'after re-opening', dest_dataset.variables['TT'][0,:,100,100]
+        #print 'v_isobaric, ', v_isobaric[0,:,100,100]
+
+##
+# MAIN
+##
+if __name__ == '__main__':
+
+    confbasic = lambda param: conf.get("BASIC", param)
+    confbasicbool = lambda param: conf.getboolean("BASIC", param)
+
+    # read args
+    (config_file, log_level) = _parse_args()
+    # read config
+    conf = ConfigParser()
+    conf.readfp(open(config_file))
+
+    start_date = datestr_to_datetime(confbasic("start_date"))
+    duration = tdelta(hours = float(confbasic("duration")))
+    frequency = tdelta(hours = float(confbasic("frequency")))
+
+    #g5nr = G5NRDataSource()
+    #input_fields = g5nr.get_input_fields()
+    
+    # Create MetField objects to map needed fields to the G5NR datasets they
+    # are in - NOT USED, ONLY FOR QUICK LOOK. Using params.py
+    '''
+    input_fields = [ 
+        MetField(g5nrName='H', srcDataset='inst30mn_3d_H_Nv'), 
+        MetField(g5nrName='T', srcDataset='inst30mn_3d_T_Nv'), 
+        MetField(g5nrName='U', srcDataset='inst30mn_3d_U_Nv'), 
+        MetField(g5nrName='V', srcDataset='inst30mn_3d_V_Nv'), 
+        MetField(g5nrName='SLP', srcDataset='inst30mn_2d_met1_Nx'), 
+        MetField(g5nrName='PS', srcDataset='inst30mn_3d_DELP_Nv'), 
+        MetField(g5nrName='PL', srcDataset='inst30mn_3d_PL_Nv'), 
+        MetField(g5nrName='QL', srcDataset='inst30mn_3d_QL_Nv'), 
+        MetField(g5nrName="QV", srcDataset="inst30mn_3d_QV_Nv"), 
+        MetField(g5nrName="RH", srcDataset="inst30mn_3d_RH_Nv"), 
+        MetField(g5nrName="TS", srcDataset="inst30mn_2d_met1_Nx"),
+        MetField(g5nrName="SNOMAS", srcDataset="tavg30mn_2d_met2_Nx"),
+        MetField(g5nrName="HLML", srcDataset="inst30mn_2d_met1_Nx"), # Need be processed w createSurfaceGeo
+        MetField(g5nrName="FRSEAICE", srcDataset="tavg30mn_2d_met2_Nx"),
+        MetField(g5nrName="FRLAND", srcDataset="const_2d_asm_Nx"), # need to be processed w createLANDSEA
+                   ]
+   '''
+   # TODO : verify fields:
+   # *Using PL for PINT, but I don't know if this is correct - 
+   #   PINT is 'pressure field on model layer interface'
+   #   PL is 'pressure at middle of each layer'
+   # * using "surface layer height (HLML) as SOILHGT ("Terrain field of source analysis")
+   # * FRSEAICE in g5nr is "fraction of each grid box that is covered by sea ice". I don't
+   #   know if this is the same as for HWRF/WPS. 
+   #   I checked one of the wrfinput files and it was all 0s.
+   #     -> accoridng  to http://www2.mmm.ucar.edu/wrf/users/wrfv3.1/polar-fractional_seaice.html,
+   #        for fractional sea ice, the "XICE" field would be used, so I'm guessing SEAICE in 
+   #        NPS expects 1/0
+   # * FRLAND is the fraction of land in GEOS5, but I think the corresponding
+   #   LANDSEA in WPS is discrete (1 for land and 0 for ocean, even though it
+   #   is classified as  "proprtn"). I'm using the FRLAND value directly for
+   #   now, but it may be necessary to discretize.
+   # * SNOMAS in g5nr is defined as "total snow storage land". SNOW in WPS correspdonds
+   #   to grib field 65, which is defined as "Water equiv. of accum. snow depth ".
+   #   Since both are measures of the water weight (kg/m**2), I think we can just use
+   #   SNOMAS directly
+   # Also:
+   #    the fields processed w create* must still be interpolated here _if_ we are to use
+   #    isobaric levels
+
+#    test
+#    input_fields = [
+#        MetField(g5nrName='T', srcDataset='inst30mn_3d_T_Nv', 
+#        MetField(g5nrName='SLP', srcDataset='inst30mn_2d_met1_Nx', levels=[1]),
+#                    ]
+
+    
+    #_logger = logging.getLogger('nr_input_generator')
+    #_logger.setLevel(log_level)
+    #formatter = logging.Formatter('%(asctime)s::%(name)s::%(levelname)s::%(message)s')
+    #ch = logging.StreamHandler()
+    #ch.setLevel(log_level)
+    #ch.setFormatter(formatter)
+    #_logger.addHandler(ch)
+    logger = _default_log(name='nr_input_generator', log2stdout=log_level)
+
+    outdir = confbasic('output_directory')
+    metInputTopdir = confbasic('src_met_output_directory')
+    lsmInputTopdir = confbasic('src_lsm_output_directory')
+    outfile = confbasic('output_file_pattern')
+    expt_id = confbasic('experiment_id')
+    make_isobaric = confbasicbool('make_isobaric')
+    extra_nps_int = confbasicbool('create_separate_nps_int')
+    if not os.path.exists(os.path.join(outdir, expt_id)):
+        os.makedirs(os.path.join(outdir, expt_id))
+    else:
+        logger.warn("Output path '{}' already exists. Data will be overwritten"
+                 .format(os.path.join(outdir, expt_id)))
+    out_path = os.path.join(outdir, expt_id, outfile)
+    nps_int_outdir = os.path.join(outdir, expt_id, 'nps_int')
+    if not os.path.exists(nps_int_outdir):
+        os.makedirs(nps_int_outdir)
+    #'g5nr_combined_hires{sfx}'.format(sfx=".%Y%m%d_%H%Mz.nc4"))
+    #met_vars = ['TT']
+    met_vars = nps_params.NPS_REQUIRED_MET_PARAMS
+    lsm_vars = nps_params.NPS_REQUIRED_LAND_PARAMS
+    generate_input(start_date, duration, frequency, out_path, nps_int_outdir,
+                   metInputDir=metInputTopdir, lsmInputDir=lsmInputTopdir, 
+                   metVars=met_vars, lsmVars=lsm_vars, makeIsobaric=make_isobaric,
+                   extraNpsInt=extra_nps_int, log=logger)

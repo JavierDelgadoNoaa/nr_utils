@@ -1,0 +1,51 @@
+&datein
+  inp%bcc=20,
+  inp%byy=06,
+  inp%bmm=09,
+  inp%bdd=04,
+  inp%bhh=00,
+  inp%model=17,           !hwrf
+  inp%lt_units='hours'    !(v)
+  inp%file_seq='multi'
+  inp%modtyp='regional',
+  inp%nesttyp='moveable'  ! if no nest?
+/
+&atcfinfo
+  atcfnum=81, !ignored
+  atcfname='HWRF',
+  atcfymdh=2006090400,
+  atcffreq=100
+/
+&trackerinfo
+  trkrinfo%westbd=,   ! these 4 are for genesis runs
+  trkrinfo%eastbd=,
+  trkrinfo%northbd=,
+  trkrinfo%southbd=,
+  trkrinfo%type='tracker',
+  trkrinfo%mslpthresh=0.0015,   !(v)
+  trkrinfo%v850thresh=1.5000,   !(v)
+  trkrinfo%gridtype='regional',
+  trkrinfo%contint=100.0,       !(v)
+  trkrinfo%out_vit='y'          ! only used in genesis mode
+/
+&phaseinfo
+  phaseflag='n',       !(v)
+  phasescheme='both'   !(v)
+  wcore_depth=1.0      !(v)
+/
+&structinfo
+  structflag='n',      ! (v) do we  want to compute additional diags for cyclone wind structure?
+  ikeflag='n'          ! (v) do we want integrated kinetic energy and surge damage potential?
+/
+&fnameinfo
+  gmodname='nmb', ! nmb.trk.bsnr_gamma.200609040000.048.00.grib
+  rundescr='trk',
+  atcfdescr='bsnr_gamma'
+/
+&waitinfo
+  use_waitfor='n',
+/
+&verbose
+   verb=99
+/
+

@@ -1,0 +1,24 @@
+DERIVED FIELDS
+ - There are two kinds of derived fields:
+  -Directly Derived Fields - These work directly with one or more netCDF
+   fields in the source data to generate the destination field.
+  -Indirectly Derived Fields - These work with the intermediate data.
+
+  Directly Derived Fields
+    - Are produced in the netCDF files (i.e. step 1)
+    - Generating function is specified in params using the fully qualified
+      function name (e.g. foo.bar.baz to use function baz from module foo.bar).
+      Of course, 'foo' must be in the PYTHONPATH.
+
+  Indirectly derived fields
+    - Are produced from the nps_int files, so no netCDF data for them
+        -> So if you have  acomplex 3rd-party tool to generate the field from,
+           this may be the better choice
+        -> But are harder to diagnose since there aren't many options for visuzlizing
+           this data
+
+
+* NOTE that transformation of data to the units expected by NPS is performed
+  when converting to the intermediate format, so the netCDF files (i.e. step 1)
+  may not be of the expected units
+ 

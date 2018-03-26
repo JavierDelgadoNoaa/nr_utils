@@ -1,0 +1,6 @@
+To run the tracker
+
+1. tracker_subsetter.py - Set parameters and run 
+2. setup_tracker.py - Set parameters and run
+3. Edit trk.nml
+4. /path/to/trk_exec < trk.nml
