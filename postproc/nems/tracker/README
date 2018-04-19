@@ -1,6 +1,18 @@
-To run the tracker
+See README in /home/Javier.Delgado/apps/nr_utils_dist/master/postproc/nems/tracker
 
-1. tracker_subsetter.py - Set parameters and run 
-2. setup_tracker.py - Set parameters and run
-3. Edit trk.nml
-4. /path/to/trk_exec < trk.nml
+
+The run_tracker.py and tracker_subsetter.py scripts are copied from there.
+
+
+General intructions:
+0. Prepare environment  - set paths in env.sh and source it
+1. Set parameters in trk.conf
+2. Run tracker_subsetter.py to generate the tracker input files from the UPP GriB files
+3. Run prepare_tracker_dir.py to set links, modify namelist, etc.
+4. Edit trk.nml
+5. ./tracker.exe < trk.nml &> logfile
+
+* To generate the three TC vitals plots - see nr_tracks.py. Note that this does not 
+  use trk.conf, all parameters are set in the script.
+
+

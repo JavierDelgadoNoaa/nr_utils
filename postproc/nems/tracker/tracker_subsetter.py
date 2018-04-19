@@ -1,7 +1,13 @@
 """
-Creates GriB files with the fields necessary by the tracker. The 
-extents of the generated files will depend on the values given below
-under 'SETTINGS'
+Use the GriB outputs from UPP to create the tracker input files.
+Uses a similar input style to the (current) operational HWRF in terms
+of the fields it produces and their size (these can be tweaked via
+variables TRACKER_SUBSET and NLATS,NLONS,DX,DY).
+The order of the fields is similar to HWRF; not the same due to the
+regridding library processing UGRD and VGRD together.
+
+ASSUMPTIONS
+- Model UPP files are in GriB 2 format
 """
 
 import os
@@ -11,17 +17,15 @@ from datetime import timedelta as tdelta
 import logging
 import shutil
 import numpy as np
+from distutils.util import strtobool
+from ConfigParser import ConfigParser
 
-from  nwpy.postproc.io.specdata import objects as specdata_objects
-from nwpy.postproc.io.specdata.objects import SpecifiedForecastDataset as SpecData
+from  nwpy.dataproc.specdata import objects as specdata_objects
+from nwpy.dataproc.specdata.objects import SpecifiedForecastDataset as SpecData
 from pycane.postproc.tracker import utils as trkutils
 import produtil
 from produtil.cd import TempDir
 from produtil.run import mpirun, mpi, openmp, checkrun, bigexe
-
-## 
-# SETTINGS
-##
 
 # The VGRD entries are automatically added to the UGRD during
 # processing since they must be regridded together
@@ -42,34 +46,60 @@ TRACKER_SUBSET=[ 'HGT:925', 'HGT:850', 'HGT:700', 'UGRD:850', 'UGRD:700',
                  'HGT:350', 'HGT:300', 'HGT:250', 'TMP:500', 'TMP:450',
                  'TMP:400', 'TMP:350', 'TMP:300', 'TMP:250' ]
 """
-INSPECS_TOPDIR = "/home/Javier.Delgado/libs/nwpy/conf/inspec"
-DATA_TOPDIR = "/home/Javier.Delgado/scratch/nems/g5nr/data/gamma/2j_5500x4000/{init_date:%Y%m%d%H}/postprd_test_wrapper"
-START_DATE = dtime(year=2006, month=9, day=4, hour=0)
 
-# ** If first fhr is not on the hour, duration should be adjusted accordingly
-#    or rounding will be off and it will look for weird forecast offsets
-# duration should be relative to 0, not first_fhr. The program will process
-# all fhrs from first_fhr to duration, inclusive
-duration = tdelta(hours=300.0) # storm10 starts @ 206hr ; storm8 ends @ 208hr
-interval = tdelta(hours=1.0)
-first_fhr = 223.0
+def confget(item, section="DEFAULT"):
+    return conf.get(section, item)
 
-inspec = [os.path.join(INSPECS_TOPDIR, "grib/upp/upp_nmb_grib2_multifile.conf")]
-domain = 1 
-TC_VITALS_PATH = "/home/Javier.Delgado/scratch/nems/g5nr/tc_stuff/tc_vitals/geos5trk/{fdate:%Y}_{stormId}.txt"
-storm_id = "08L"
-find_nearest_fdate = True
-NLATS = 830
-NLONS = 830
-DX = 0.018
-DY = 0.018
-MAKE_GRIB1 = True # tracker needs grib1
-
-GRIB2_TO_GRIB1 = "/home/Javier.Delgado/local/bin/grib2_to_grib1"
+def datestr_to_datetime(startDate):
+    """  
+    Convert a string in `MM-DD-YYYY hh:mm' format to a datetime
+    @param startDate The String
+    @return the datetime object
+    """
+    try: 
+        mdy = startDate.split(" ")[0]
+        hm = startDate.split(" ")[1]
+        (month, day, year) = [int(x) for x in mdy.split("-")]
+        (hour, minute) = [int(x) for x in hm.split(":")]
+        #startDate = startDate.replace("'", "").replace('"', '')
+        #os.environ['TZ'] = 'UTC'
+        #tzset()
+        #return time.mktime(time.strptime(startDate, '%m-%d-%Y %H:%M'))
+        return dtime(year=year, month=month, day=day,
+                                 hour=hour, minute=minute)
+    except ValueError:
+        print 'Given start date', startDate, 'does not match expected format MM-DD-YYYY hh:mm'
+        sys.exit(1)
 
 ##
-# LOGIC
+# CONFIG 
 ##
+#INSPECS_TOPDIR = "/home/Javier.Delgado/libs/nwpy/conf/inspec"
+#DATA_TOPDIR ="/home/Javier.Delgado/scratch/nems/g5nr/data/gamma/plan_b_1.5km/alternative/{init_date:%Y%m%d%H}/postprd"
+conf = ConfigParser()
+conf.read(["trk.conf"])
+data_topdir_pattern = confget("data_topdir")
+start_date = datestr_to_datetime(confget("start_date"))
+duration = tdelta(hours=float(confget("duration_hours")))
+interval = tdelta(hours=float(confget("interval_hours")))
+first_fhr = float(confget("first_forecast_hour"))
+inspec = [confget("inspec")]
+domain = confget("domain")
+tc_vitals_path = confget("tc_vitals_path")
+storm_number = int(confget("storm_number"))
+storm_basin = confget("storm_basin")
+storm_id = "{0:02d}{1}".format(storm_number, storm_basin)
+find_nearest_fdate = strtobool(confget("find_nearest_fdate"))
+
+## The following 4 parameters determine the size and resolution of the output 
+nlats = int(confget("num_latitude_grid_points"))
+nlons = int(confget("num_longitude_grid_points"))
+dx = float(confget("dx"))
+dy = float(confget("dy"))
+make_grib1 = strtobool(confget("make_grib1"))
+grib2_to_grib1_exe = confget("grib2_to_grib1_exe")
+tmpdir = confget("temp_directory")
+
 def _default_log(log2stdout=logging.INFO, log2file=None, name='el_default'):
     global _logger
     if _logger is None:
@@ -125,7 +155,7 @@ def get_cen_latlon(curr_fdate, find_nearest_fdate=False):
     :returns: 2-tuple consisting of center lat and lon
     """
     args = dict(fdate=curr_fdate, stormId=storm_id)
-    path = TC_VITALS_PATH.format(**args)
+    path = tc_vitals_path.format(**args)
     trk = trkutils.get_track_data(path)
     # map forecast dates to pycane.postproc.tracker.objects.TrackerEntry objects
     trk_fdates = trk.fcst_date_dict 
@@ -150,12 +180,6 @@ def subset_and_regrid(infile, outfile, fieldstr, latstr, lonstr):
     Extract a field from infile according to `fieldstr' which can be
     just the field pname or "pname:levValue" or "pname:levValue levUnit"
     """
-#field = "UGRD|VGRD" # TODO : Need to do these together?
-#lonstr = '224:5000:0.027' # northern-point
-#latstr = '-21:2500:0.027' # eastern/western point
-    #if lev is None: fieldstr = pname
-    #else: fieldstr = pname + ":" + str(lev)
-    
     # winds must be subset/regridded together
     #import pdb ; pdb.set_trace()
     if fieldstr[0:4] == "UGRD":
@@ -166,14 +190,12 @@ def subset_and_regrid(infile, outfile, fieldstr, latstr, lonstr):
     # assume file name for VGRD is same as UGRD with VGRD in name instead
     infile2 = infile.replace("UGRD", "VGRD")
     if infile != infile2:
-        infile_tmp = "/home/Javier.Delgado/scratch/tmp_winds.grb2"
+        infile_tmp = os.path.join(tmpdir, "tmp_winds.grb2")
         if os.path.exists(infile_tmp): os.unlink(infile_tmp)
-        #cat_file(infile, infile_tmp)
-        #cat_file(infile2, infile_tmp)
         #import pdb ; pdb.set_trace()
         for fld,fil in zip(["UGRD","VGRD"], [infile, infile2]): 
             # NOTE : U must be adjacent to V and come first in the grib file 
-            # for the new_grid to work
+            # for the new_grid option of wgrib2 to work
             fld = fld + ":" + lev
             tmp_tmpfile = infile_tmp + ".tmp"
             if os.path.exists(tmp_tmpfile): os.unlink(tmp_tmpfile)
@@ -207,7 +229,6 @@ def pname_to_standard_name(name):
 ##
 # MAIN
 ##
-if MAKE_GRIB1: assert os.path.exists(GRIB2_TO_GRIB1)
 numTimesteps =  ((duration.total_seconds()-first_fhr*3600) / interval.total_seconds()) + 1
 offsets = np.linspace(first_fhr*3600, duration.total_seconds(), numTimesteps)
 for fcstOffset in offsets:
@@ -215,13 +236,13 @@ for fcstOffset in offsets:
     fmin = int( round(int( fcstOffset / 60 ) % 60, 0) )
     #import pdb ; pdb.set_trace()
     log = _default_log()
-    data_topdir = DATA_TOPDIR.format(init_date=START_DATE)
+    data_topdir = data_topdir_pattern.format(init_date=start_date)
     fcst_offset = tdelta(hours=fhr, minutes=fmin)
-    specdata = SpecData(inspec, data_topdir, START_DATE,
-                        fcst_offset=fcst_offset, domain=domain,
-                        inspecsTopdir=INSPECS_TOPDIR)
+    specdata = SpecData(inspec, data_topdir, start_date,
+                        fcst_offset=fcst_offset, domain=domain,)
+                       # inspecsTopdir=INSPECS_TOPDIR)
     outfile = "nmbtrk.{init_date:%Y%m%d%H}.f{fhr:03d}.{fmin:02d}.grb2"
-    outfile = outfile.format(init_date=START_DATE, fhr=fhr, fmin=fmin)
+    outfile = outfile.format(init_date=start_date, fhr=fhr, fmin=fmin)
     for fieldstr in TRACKER_SUBSET:
         #print fieldstr
         if not ":" in fieldstr:
@@ -239,18 +260,15 @@ for fcstOffset in offsets:
             filename = specdata.get_filename(fieldName, levType)
         print 'filename = ', filename
         
-        curr_fdate = START_DATE + fcst_offset
+        curr_fdate = start_date + fcst_offset
         (cenlat,cenlon) = get_cen_latlon(curr_fdate, find_nearest_fdate)
-        #import pdb ; pdb.set_trace()
-        #north_lat = ( (NLATS/2) * DY ) + cenlat
-        #east_lon = ( (NLONS/2) * DX ) + cenlon
-        south_lat = cenlat - ( (NLATS/2) * DY ) 
-        west_lon = cenlon - ( (NLONS/2) * DX )
-        latstr = str(south_lat) + ":" + str(NLATS) + ":" + str(DY)
-        lonstr = str(west_lon) + ":" + str(NLONS) + ":" + str(DX)
+        south_lat = cenlat - ( (nlats/2) * dy ) 
+        west_lon = cenlon - ( (nlons/2) * dx )
+        latstr = str(south_lat) + ":" + str(nlats) + ":" + str(dy)
+        lonstr = str(west_lon) + ":" + str(nlons) + ":" + str(dx)
         outfile_tmp = outfile + ".tmp"
         subset_and_regrid(filename, outfile_tmp, fieldstr, latstr, lonstr)
         cat_file(outfile_tmp, outfile)
         #output to merged outfile
-    if MAKE_GRIB1:
-        subprocess.check_call([GRIB2_TO_GRIB1, outfile, outfile.replace("grb2","grb1")])
+    if make_grib1:
+        subprocess.check_call([grib2_to_grib1_exe, outfile, outfile.replace("grb2","grb1")])

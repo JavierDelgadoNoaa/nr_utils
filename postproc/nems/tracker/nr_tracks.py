@@ -24,13 +24,14 @@ from pycane.postproc.viz.tcv import tcv_plot_helper, track_plotter
 
 if __name__ == '__main__':
 
-    names = ['BSNR, NAM physics (GFDL tracker)',
-             'BSNR, HWRF physics (GFDL tracker)',
+    names = ['BSNR, 2km (GFDL tracker)',
+             'BSNR, 1.5km (GFDL tracker)',
              'G5NR (G5NR tracker)',
             ]
     paths = [ 
               "/home/Javier.Delgado/scratch/nems/g5nr/data/gamma/2j_5500x4000/2006090400/nam_physics/tracker_rundir/fort.69",
-              "/scratch4/NAGAPE/aoml-osse/Javier.Delgado/nems/g5nr/data/gamma/2j_5500x4000/2006090400/hwrf_physics/tracker/fort.69",
+              ##"/scratch4/NAGAPE/aoml-osse/Javier.Delgado/nems/g5nr/data/gamma/plan_b_1.5km/alternative/2006090400/nam_physics/tracker_rundir/fort.69",
+              "/scratch4/NAGAPE/aoml-osse/Javier.Delgado/nems/g5nr/data/gamma/plan_b_1.5km/alternative/tracker_rundir/fort.69",
               "/home/Javier.Delgado/scratch/nems/g5nr/tc_stuff/tc_vitals/geos5trk/2006_08L.txt",
             ]
     colors = [
@@ -52,7 +53,7 @@ if __name__ == '__main__':
     start_date = dtime(year=2006, month=9, day=4, hour=00) + tdelta(hours=first_fhr)
     #end_date = dtime(year=2006, month=9, day=13, hour=1) # bsnr last
     #end_date = dtime(year=2006, month=9, day=12, hour=3) # g5nr ends 9/12@3z
-    end_date = dtime(year=2006, month=9, day=11, hour=22) # ...and has gap @ 9/11@23z
+    end_date = dtime(year=2006, month=9, day=11, hour=12) # ...and has gap @ 9/11@23z
     interval = tdelta(hours=1)
 
     # Set the "initialization" dates, which will be used to calculate the 
