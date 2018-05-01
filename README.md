@@ -1,6 +1,6 @@
 Utilities for preprocessing and postprocessing the NMM-B Nature Run initialized from G5NR
 This package consists of tools for preprocessing and postprocessing
-nature run data. It's implementation is geared towards preprocessing
+nature run data. It also contains scripts for running NMM-B on large grids. It's implementation is geared towards preprocessing
 data from G5NR for the NEMS Preprocessing System (NPS).
 The postprocessing is geared towards using NEMS/NMM-B model and UPP 
 output.
@@ -26,6 +26,9 @@ DESCRIPTION OF SCRIPTS
 
 
 SETTING UP
- - Set paths in env.sh
-
+ - Preprocessing
+    - Set paths in env.sh
+ - Running NMM-B
+    - Set up directory as usual and use the scripts under run/
+      -> may need to tweak job scheduling parameters
 
